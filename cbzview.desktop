@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=cbzview
+GenericName=Comic Book Reader
+Comment=Fast, hardware-accelerated CBZ comic reader
+Exec=cbzview %f
+Icon=cbzview
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=application/vnd.comicbook+zip;application/x-cbz;
+StartupNotify=true
+StartupWMClass=cbzview

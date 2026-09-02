@@ -1,0 +1,8 @@
+*.o
+src/*.o
+cbzview
+pkg/
+src_pkg/
+*.tar.*
+*.pkg.tar.zst
+.SRCINFO

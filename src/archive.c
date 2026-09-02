@@ -1,0 +1,217 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "archive.h"
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int is_image_extension(const char *name)
+{
+    const char *ext = strrchr(name, '.');
+    return ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0 ||
+    strcasecmp(ext, ".jfif") == 0 || strcasecmp(ext, ".webp") == 0 ||
+    strcasecmp(ext, ".png") == 0 || strcasecmp(ext, ".avif") == 0 ||
+    strcasecmp(ext, ".jxl") == 0);
+}
+
+static int compare_natural(const void *a, const void *b)
+{
+    const PageMeta *pa = a;
+    const PageMeta *pb = b;
+    return strverscmp(pa->filename, pb->filename);
+}
+
+CBZArchive *archive_open(const char *filepath)
+{
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        perror("Error opening CBZ archive");
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return NULL;
+    }
+    size_t file_size = (size_t)st.st_size;
+
+    void *mmap_base = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (mmap_base == MAP_FAILED) {
+        perror("mmap failed for CBZ file");
+        close(fd);
+        return NULL;
+    }
+
+    madvise(mmap_base, file_size, MADV_RANDOM);
+
+    zip_error_t zerr;
+    zip_error_init(&zerr);
+    zip_source_t *src = zip_source_buffer_create(mmap_base, file_size, 0, &zerr);
+    if (!src) {
+        fprintf(stderr, "zip_source_buffer_create failed: %s\n", zip_error_strerror(&zerr));
+        zip_error_fini(&zerr);
+        munmap(mmap_base, file_size);
+        close(fd);
+        return NULL;
+    }
+
+    zip_t *za = zip_open_from_source(src, ZIP_RDONLY, &zerr);
+    if (!za) {
+        fprintf(stderr, "zip_open_from_source failed: %s\n", zip_error_strerror(&zerr));
+        zip_source_free(src);
+        zip_error_fini(&zerr);
+        munmap(mmap_base, file_size);
+        close(fd);
+        return NULL;
+    }
+    zip_error_fini(&zerr);
+
+    zip_int64_t num_entries = zip_get_num_entries(za, 0);
+    if (num_entries < 0) {
+        zip_close(za);
+        munmap(mmap_base, file_size);
+        close(fd);
+        return NULL;
+    }
+
+    CBZArchive *arch = calloc(1, sizeof(*arch));
+    if (!arch) {
+        zip_close(za);
+        munmap(mmap_base, file_size);
+        close(fd);
+        return NULL;
+    }
+
+    arch->za = za;
+    arch->fd = fd;
+    arch->mmap_base = mmap_base;
+    arch->file_size = file_size;
+    pthread_mutex_init(&arch->lock, NULL);
+
+    arch->pages = calloc((size_t)num_entries, sizeof(*arch->pages));
+    if (num_entries > 0 && !arch->pages) {
+        archive_close(arch);
+        return NULL;
+    }
+
+    zip_int64_t comic_info_idx = -1;
+
+    for (zip_uint64_t i = 0; i < (zip_uint64_t)num_entries; i++) {
+        const char *name = zip_get_name(za, i, 0);
+        if (!name || !*name || name[strlen(name) - 1] == '/' || strstr(name, "__MACOSX") != NULL)
+            continue;
+
+        if (strcasecmp(name, "ComicInfo.xml") == 0 || strcasecmp(name, "comicinfo.xml") == 0) {
+            comic_info_idx = (zip_int64_t)i;
+            continue;
+        }
+
+        if (!is_image_extension(name))
+            continue;
+
+        struct zip_stat entry_st;
+        if (zip_stat_index(za, i, 0, &entry_st) != 0 || entry_st.size > SIZE_MAX)
+            continue;
+
+        PageMeta *page = &arch->pages[arch->total_pages];
+        page->filename = strdup(name);
+        if (!page->filename) {
+            archive_close(arch);
+            return NULL;
+        }
+        page->index = i;
+        page->uncomp_size = entry_st.size;
+        page->type = PAGE_TYPE_STORY;
+        arch->total_pages++;
+    }
+
+    qsort(arch->pages, (size_t)arch->total_pages, sizeof(*arch->pages), compare_natural);
+
+    /* Parse ComicInfo.xml metadata if present */
+    arch->info = comicinfo_create();
+    if (arch->info && comic_info_idx >= 0) {
+        struct zip_stat xml_st;
+        if (zip_stat_index(za, (zip_uint64_t)comic_info_idx, 0, &xml_st) == 0 && xml_st.size > 0 && xml_st.size < 50000000) {
+            zip_file_t *zf = zip_fopen_index(za, (zip_uint64_t)comic_info_idx, 0);
+            if (zf) {
+                char *xml_buf = malloc(xml_st.size + 1);
+                if (xml_buf) {
+                    zip_int64_t r = zip_fread(zf, xml_buf, xml_st.size);
+                    if (r > 0) {
+                        xml_buf[r] = '\0';
+                        comicinfo_parse_xml(arch->info, xml_buf, (size_t)r, arch->total_pages);
+                    }
+                    free(xml_buf);
+                }
+                zip_fclose(zf);
+            }
+        }
+    }
+
+    return arch;
+}
+
+unsigned char *archive_read_file(CBZArchive *arch, int page_idx, size_t *out_size)
+{
+    if (!arch || !out_size || page_idx < 0 || page_idx >= arch->total_pages)
+        return NULL;
+
+    size_t size = (size_t)arch->pages[page_idx].uncomp_size;
+    unsigned char *buffer = malloc(size ? size : 1);
+    if (!buffer)
+        return NULL;
+
+    /* Lock around libzip extraction to prevent thread collisions */
+    pthread_mutex_lock(&arch->lock);
+
+    zip_file_t *zf = zip_fopen_index(arch->za, arch->pages[page_idx].index, 0);
+    if (!zf) {
+        pthread_mutex_unlock(&arch->lock);
+        free(buffer);
+        return NULL;
+    }
+
+    zip_int64_t bytes_read = zip_fread(zf, buffer, size);
+    zip_fclose(zf);
+
+    pthread_mutex_unlock(&arch->lock);
+
+    if (bytes_read < 0 || (size_t)bytes_read != size) {
+        free(buffer);
+        return NULL;
+    }
+
+    *out_size = (size_t)bytes_read;
+    return buffer;
+}
+
+void archive_close(CBZArchive *arch)
+{
+    if (!arch)
+        return;
+
+    comicinfo_destroy(arch->info);
+    for (int i = 0; i < arch->total_pages; i++)
+        free(arch->pages[i].filename);
+    free(arch->pages);
+
+    pthread_mutex_destroy(&arch->lock);
+
+    if (arch->za)
+        zip_close(arch->za);
+    if (arch->mmap_base && arch->file_size)
+        munmap(arch->mmap_base, arch->file_size);
+    if (arch->fd >= 0)
+        close(arch->fd);
+
+    free(arch);
+}
