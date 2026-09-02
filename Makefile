@@ -1,7 +1,8 @@
 CC ?= gcc
-CFLAGS ?= -O3 -march=native -Wall -Wextra -D_GNU_SOURCE -DGL_GLEXT_PROTOTYPES -pthread \
-         $(shell pkg-config --cflags glfw3 libzip libturbojpeg libwebp libpng gl)
-LIBS = $(shell pkg-config --libs glfw3 libzip libturbojpeg libwebp libpng gl) -pthread -lm
+CFLAGS ?= -O3 -march=native -Wall -Wextra
+override CFLAGS += -D_GNU_SOURCE -DGL_GLEXT_PROTOTYPES -pthread \
+                   $(shell pkg-config --cflags glfw3 libzip libturbojpeg libwebp libpng gl)
+LIBS = $(shell pkg-config --libs glfw3 libzip libturbojpeg libwebp libpng gl) -pthread
 
 PREFIX ?= /usr
 BINDIR = $(PREFIX)/bin
@@ -22,7 +23,7 @@ TARGET = cbzview
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(CC) $(OBJ) -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $(OBJ) -o $@ $(LIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -1,22 +1,39 @@
-# Maintainer: cbzview contributors
-pkgname=cbzview
-pkgver=1.0.0
+# Maintainer: nebiki <alexandriagustaf@gmail.com>
+pkgname=cbzview-git
+pkgver=r1.0000000
 pkgrel=1
-pkgdesc="Fast, hardware-accelerated CBZ comic reader"
-arch=('x86_64')
-url="https://local.cbzview"
-license=('custom:MIT')
-depends=('glfw' 'libzip' 'libjpeg-turbo' 'libwebp' 'libpng')
-makedepends=('gcc' 'pkgconf')
-source=()
+pkgdesc="fast Linux CBZ comic & manga viewer with mmap, PBO streaming, and bicubic screentone anti-aliasing"
+arch=('x86_64' 'aarch64')
+url="https://github.com/alexantSWE/cbzview"
+license=('MIT')
+depends=(
+    'glibc'
+    'glfw'
+    'libzip'
+    'libjpeg-turbo'
+    'libwebp'
+    'libpng'
+    'libglvnd'
+    'hicolor-icon-theme'
+)
+makedepends=('git' 'gcc' 'pkgconf' 'make')
+provides=('cbzview')
+conflicts=('cbzview')
+source=("git+https://github.com/alexantSWE/cbzview.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/cbzview"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
 
 build() {
-    cd "$startdir"
-    make clean
-    make
+    cd "$srcdir/cbzview"
+    make -j$(nproc)
 }
 
 package() {
-    cd "$startdir"
-    make DESTDIR="$pkgdir" PREFIX="/usr" install
+    cd "$srcdir/cbzview"
+    make DESTDIR="$pkgdir" PREFIX=/usr install
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
