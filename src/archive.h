@@ -26,7 +26,10 @@ typedef struct {
 } CBZArchive;
 
 CBZArchive *archive_open(const char *filepath);
+zip_t *archive_open_worker_handle(CBZArchive *arch);
+void archive_close_worker_handle(zip_t *za);
 unsigned char *archive_read_file(CBZArchive *arch, int page_idx, size_t *out_size);
+unsigned char *archive_read_file_worker(CBZArchive *arch, zip_t *za, int page_idx, size_t *out_size);
 void archive_close(CBZArchive *arch);
 
 #endif /* ARCHIVE_H */

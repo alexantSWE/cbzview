@@ -11,6 +11,7 @@ typedef struct {
     int page_idx;
     int width;
     int height;
+    int channels; /* 3 for RGB (JPEG), 4 for RGBA (PNG/WebP) */
     unsigned char *rgba;
     size_t buffer_capacity;
     int is_ready;
@@ -39,6 +40,7 @@ PageDecoder *decoder_init(CBZArchive *arch);
 void decoder_request_page(PageDecoder *dec, int page_idx, int direction);
 DecodedSlot *decoder_get_slot(PageDecoder *dec, int page_idx);
 DecodedSlot *decoder_get_slot_locked(PageDecoder *dec, int page_idx);
+int decoder_get_slot_index_locked(PageDecoder *dec, int page_idx);
 void decoder_lock(PageDecoder *dec);
 void decoder_unlock(PageDecoder *dec);
 void decoder_cleanup(PageDecoder *dec);

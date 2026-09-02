@@ -134,16 +134,18 @@ ComicRenderer *renderer_init(void)
     return rend;
 }
 
-static GLuint sync_texture(ComicRenderer *rend, DecodedSlot *slot)
+static GLuint sync_texture(ComicRenderer *rend, DecodedSlot *slot, int slot_idx)
 {
-    if (!slot || !slot->is_ready || !slot->rgba)
+    if (!slot || !slot->is_ready || !slot->rgba || slot_idx < 0 || slot_idx >= CACHE_CAPACITY)
         return 0;
 
-    int slot_idx = slot->page_idx % CACHE_CAPACITY;
     GPUTextureSlot *tex_slot = &rend->textures[slot_idx];
+    GLenum gl_fmt = (slot->channels == 3) ? GL_RGB : GL_RGBA;
+    GLenum gl_internal = (slot->channels == 3) ? GL_RGB8 : GL_RGBA8;
+    size_t bpp = (size_t)slot->channels;
 
     if (tex_slot->page_idx != slot->page_idx) {
-        size_t size = (size_t)slot->width * (size_t)slot->height * 4;
+        size_t size = (size_t)slot->width * (size_t)slot->height * bpp;
 
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, tex_slot->pbo_id);
         glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)size, NULL, GL_STREAM_DRAW);
@@ -154,14 +156,15 @@ static GLuint sync_texture(ComicRenderer *rend, DecodedSlot *slot)
         }
 
         glBindTexture(GL_TEXTURE_2D, tex_slot->tex_id);
-        if (tex_slot->alloc_w == slot->width && tex_slot->alloc_h >= slot->height) {
+        if (tex_slot->alloc_w == slot->width && tex_slot->alloc_h == slot->height && tex_slot->alloc_channels == slot->channels) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, slot->width, slot->height,
-                            GL_RGBA, GL_UNSIGNED_BYTE, 0);
+                            gl_fmt, GL_UNSIGNED_BYTE, 0);
         } else {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, slot->width, slot->height,
-                         0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+            glTexImage2D(GL_TEXTURE_2D, 0, (GLint)gl_internal, slot->width, slot->height,
+                         0, gl_fmt, GL_UNSIGNED_BYTE, 0);
             tex_slot->alloc_w = slot->width;
             tex_slot->alloc_h = slot->height;
+            tex_slot->alloc_channels = slot->channels;
         }
 
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -210,7 +213,9 @@ void renderer_render_frame(ComicRenderer *rend, PageDecoder *dec, int cur_page, 
     }
 
     decoder_lock(dec);
-    DecodedSlot *cur_slot = decoder_get_slot_locked(dec, cur_page);
+
+    int cur_sidx = decoder_get_slot_index_locked(dec, cur_page);
+    DecodedSlot *cur_slot = (cur_sidx >= 0) ? &dec->slots[cur_sidx] : NULL;
 
     int is_cover_or_spread = 0;
     if (dec->arch->info && dec->arch->info->has_metadata && cur_page < dec->arch->info->page_type_count) {
@@ -226,22 +231,40 @@ void renderer_render_frame(ComicRenderer *rend, PageDecoder *dec, int cur_page, 
             float scale = (float)win_w / (float)cur_slot->width;
             float h = cur_slot->height * scale;
             float top = -h / 2.0f;
-            draw_quad(sync_texture(rend, cur_slot), -(float)win_w / 2.0f, top, (float)win_w / 2.0f, top + h);
+            GLuint cur_tex = sync_texture(rend, cur_slot, cur_sidx);
 
+            GLuint next_tex = 0;
+            float nh = 0.0f;
             if (cur_page + 1 < dec->arch->total_pages) {
-                DecodedSlot *next = decoder_get_slot_locked(dec, cur_page + 1);
-                if (next) {
-                    float nh = next->height * ((float)win_w / (float)next->width);
-                    draw_quad(sync_texture(rend, next), -(float)win_w / 2.0f, top + h, (float)win_w / 2.0f, top + h + nh);
+                int next_sidx = decoder_get_slot_index_locked(dec, cur_page + 1);
+                if (next_sidx >= 0) {
+                    DecodedSlot *next = &dec->slots[next_sidx];
+                    nh = next->height * ((float)win_w / (float)next->width);
+                    next_tex = sync_texture(rend, next, next_sidx);
                 }
             }
+
+            GLuint prev_tex = 0;
+            float ph = 0.0f;
             if (cur_page > 0) {
-                DecodedSlot *prev = decoder_get_slot_locked(dec, cur_page - 1);
-                if (prev) {
-                    float ph = prev->height * ((float)win_w / (float)prev->width);
-                    draw_quad(sync_texture(rend, prev), -(float)win_w / 2.0f, top - ph, (float)win_w / 2.0f, top);
+                int prev_sidx = decoder_get_slot_index_locked(dec, cur_page - 1);
+                if (prev_sidx >= 0) {
+                    DecodedSlot *prev = &dec->slots[prev_sidx];
+                    ph = prev->height * ((float)win_w / (float)prev->width);
+                    prev_tex = sync_texture(rend, prev, prev_sidx);
                 }
             }
+
+            /* Release lock immediately before drawing quads */
+            decoder_unlock(dec);
+
+            draw_quad(cur_tex, -(float)win_w / 2.0f, top, (float)win_w / 2.0f, top + h);
+            if (next_tex)
+                draw_quad(next_tex, -(float)win_w / 2.0f, top + h, (float)win_w / 2.0f, top + h + nh);
+            if (prev_tex)
+                draw_quad(prev_tex, -(float)win_w / 2.0f, top - ph, (float)win_w / 2.0f, top);
+
+            goto finish_render;
         }
     } else if (rend->layout == LAYOUT_SINGLE || cur_page == 0 || is_wide || is_cover_or_spread) {
         if (cur_slot) {
@@ -249,14 +272,21 @@ void renderer_render_frame(ComicRenderer *rend, PageDecoder *dec, int cur_page, 
             : ((float)win_w / (float)cur_slot->width);
             float w = cur_slot->width * scale;
             float h = cur_slot->height * scale;
-            draw_quad(sync_texture(rend, cur_slot), -w / 2.0f, -h / 2.0f, w / 2.0f, h / 2.0f);
+            GLuint tex = sync_texture(rend, cur_slot, cur_sidx);
+
+            decoder_unlock(dec);
+            draw_quad(tex, -w / 2.0f, -h / 2.0f, w / 2.0f, h / 2.0f);
+            goto finish_render;
         }
     } else {
         int left_idx = (rend->direction == DIR_LTR) ? cur_page : cur_page + 1;
         int right_idx = (rend->direction == DIR_LTR) ? cur_page + 1 : cur_page;
 
-        DecodedSlot *left_slot = decoder_get_slot_locked(dec, left_idx);
-        DecodedSlot *right_slot = decoder_get_slot_locked(dec, right_idx);
+        int left_sidx = decoder_get_slot_index_locked(dec, left_idx);
+        int right_sidx = decoder_get_slot_index_locked(dec, right_idx);
+
+        DecodedSlot *left_slot = (left_sidx >= 0) ? &dec->slots[left_sidx] : NULL;
+        DecodedSlot *right_slot = (right_sidx >= 0) ? &dec->slots[right_sidx] : NULL;
 
         if (left_slot && right_slot) {
             float total_w = (float)(left_slot->width + right_slot->width);
@@ -269,22 +299,33 @@ void renderer_render_frame(ComicRenderer *rend, PageDecoder *dec, int cur_page, 
             float rw = right_slot->width * scale;
             float rh = right_slot->height * scale;
 
-            draw_quad(sync_texture(rend, left_slot), -lw, -lh / 2.0f, 0.0f, lh / 2.0f);
-            draw_quad(sync_texture(rend, right_slot), 0.0f, -rh / 2.0f, rw, rh / 2.0f);
+            GLuint left_tex = sync_texture(rend, left_slot, left_sidx);
+            GLuint right_tex = sync_texture(rend, right_slot, right_sidx);
+
+            decoder_unlock(dec);
+            draw_quad(left_tex, -lw, -lh / 2.0f, 0.0f, lh / 2.0f);
+            draw_quad(right_tex, 0.0f, -rh / 2.0f, rw, rh / 2.0f);
+            goto finish_render;
         } else {
             DecodedSlot *single = left_slot ? left_slot : right_slot;
+            int single_sidx = left_slot ? left_sidx : right_sidx;
             if (single) {
                 float scale = (rend->fit == FIT_HEIGHT) ? ((float)win_h / (float)single->height)
                 : ((float)win_w / (float)single->width);
                 float w = single->width * scale;
                 float h = single->height * scale;
-                draw_quad(sync_texture(rend, single), -w / 2.0f, -h / 2.0f, w / 2.0f, h / 2.0f);
+                GLuint single_tex = sync_texture(rend, single, single_sidx);
+
+                decoder_unlock(dec);
+                draw_quad(single_tex, -w / 2.0f, -h / 2.0f, w / 2.0f, h / 2.0f);
+                goto finish_render;
             }
         }
     }
 
     decoder_unlock(dec);
 
+finish_render:
     if (rend->shader_prog)
         glUseProgram(0);
     glDisable(GL_TEXTURE_2D);

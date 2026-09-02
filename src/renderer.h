@@ -32,6 +32,7 @@ typedef struct {
     int page_idx;
     int alloc_w;
     int alloc_h;
+    int alloc_channels;
 } GPUTextureSlot;
 
 typedef struct {

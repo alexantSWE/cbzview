@@ -160,9 +160,36 @@ CBZArchive *archive_open(const char *filepath)
     return arch;
 }
 
-unsigned char *archive_read_file(CBZArchive *arch, int page_idx, size_t *out_size)
+zip_t *archive_open_worker_handle(CBZArchive *arch)
 {
-    if (!arch || !out_size || page_idx < 0 || page_idx >= arch->total_pages)
+    if (!arch || !arch->mmap_base || arch->file_size == 0)
+        return NULL;
+
+    zip_error_t zerr;
+    zip_error_init(&zerr);
+    zip_source_t *src = zip_source_buffer_create(arch->mmap_base, arch->file_size, 0, &zerr);
+    if (!src) {
+        zip_error_fini(&zerr);
+        return NULL;
+    }
+
+    zip_t *za = zip_open_from_source(src, ZIP_RDONLY, &zerr);
+    if (!za) {
+        zip_source_free(src);
+    }
+    zip_error_fini(&zerr);
+    return za;
+}
+
+void archive_close_worker_handle(zip_t *za)
+{
+    if (za)
+        zip_close(za);
+}
+
+unsigned char *archive_read_file_worker(CBZArchive *arch, zip_t *za, int page_idx, size_t *out_size)
+{
+    if (!arch || !za || !out_size || page_idx < 0 || page_idx >= arch->total_pages)
         return NULL;
 
     size_t size = (size_t)arch->pages[page_idx].uncomp_size;
@@ -170,20 +197,14 @@ unsigned char *archive_read_file(CBZArchive *arch, int page_idx, size_t *out_siz
     if (!buffer)
         return NULL;
 
-    /* Lock around libzip extraction to prevent thread collisions */
-    pthread_mutex_lock(&arch->lock);
-
-    zip_file_t *zf = zip_fopen_index(arch->za, arch->pages[page_idx].index, 0);
+    zip_file_t *zf = zip_fopen_index(za, arch->pages[page_idx].index, 0);
     if (!zf) {
-        pthread_mutex_unlock(&arch->lock);
         free(buffer);
         return NULL;
     }
 
     zip_int64_t bytes_read = zip_fread(zf, buffer, size);
     zip_fclose(zf);
-
-    pthread_mutex_unlock(&arch->lock);
 
     if (bytes_read < 0 || (size_t)bytes_read != size) {
         free(buffer);
@@ -192,6 +213,16 @@ unsigned char *archive_read_file(CBZArchive *arch, int page_idx, size_t *out_siz
 
     *out_size = (size_t)bytes_read;
     return buffer;
+}
+
+unsigned char *archive_read_file(CBZArchive *arch, int page_idx, size_t *out_size)
+{
+    if (!arch)
+        return NULL;
+    pthread_mutex_lock(&arch->lock);
+    unsigned char *buf = archive_read_file_worker(arch, arch->za, page_idx, out_size);
+    pthread_mutex_unlock(&arch->lock);
+    return buf;
 }
 
 void archive_close(CBZArchive *arch)

@@ -14,10 +14,11 @@ typedef struct {
     PageDecoder *dec;
     int thread_id;
     tjhandle tj;
+    zip_t *za;
 } WorkerContext;
 
 static int decode_jpeg(tjhandle tj, const unsigned char *compressed, size_t size,
-                       int *out_w, int *out_h, unsigned char **out_rgba, size_t *buf_cap)
+                       int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
     int width, height, subsamp, colorspace;
     if (tjDecompressHeader3(tj, compressed, (unsigned long)size,
@@ -27,11 +28,12 @@ static int decode_jpeg(tjhandle tj, const unsigned char *compressed, size_t size
     if (width <= 0 || height <= 0 || (size_t)width * (size_t)height > SIZE_MAX / 4)
         return 0;
 
-    size_t needed = (size_t)width * (size_t)height * 4;
+    /* 3 bytes per pixel for RGB: 25% less RAM and PCIe bandwidth */
+    size_t needed = (size_t)width * (size_t)height * 3;
     if (*buf_cap < needed) {
-        free(*out_rgba);
-        *out_rgba = malloc(needed);
-        if (!*out_rgba) {
+        free(*out_pixels);
+        *out_pixels = malloc(needed);
+        if (!*out_pixels) {
             *buf_cap = 0;
             return 0;
         }
@@ -39,16 +41,17 @@ static int decode_jpeg(tjhandle tj, const unsigned char *compressed, size_t size
     }
 
     if (tjDecompress2(tj, compressed, (unsigned long)size,
-        *out_rgba, width, 0, height, TJPF_RGBA, TJFLAG_FASTDCT) != 0)
+        *out_pixels, width, 0, height, TJPF_RGB, TJFLAG_FASTDCT) != 0)
         return 0;
 
     *out_w = width;
     *out_h = height;
+    *out_channels = 3;
     return 1;
 }
 
 static int decode_webp(const unsigned char *compressed, size_t size,
-                       int *out_w, int *out_h, unsigned char **out_rgba, size_t *buf_cap)
+                       int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
     int width, height;
     if (!WebPGetInfo(compressed, size, &width, &height) || width <= 0 || height <= 0)
@@ -56,25 +59,26 @@ static int decode_webp(const unsigned char *compressed, size_t size,
 
     size_t needed = (size_t)width * (size_t)height * 4;
     if (*buf_cap < needed) {
-        free(*out_rgba);
-        *out_rgba = malloc(needed);
-        if (!*out_rgba) {
+        free(*out_pixels);
+        *out_pixels = malloc(needed);
+        if (!*out_pixels) {
             *buf_cap = 0;
             return 0;
         }
         *buf_cap = needed;
     }
 
-    if (!WebPDecodeRGBAInto(compressed, size, *out_rgba, needed, width * 4))
+    if (!WebPDecodeRGBAInto(compressed, size, *out_pixels, needed, width * 4))
         return 0;
 
     *out_w = width;
     *out_h = height;
+    *out_channels = 4;
     return 1;
 }
 
 static int decode_png(const unsigned char *compressed, size_t size,
-                      int *out_w, int *out_h, unsigned char **out_rgba, size_t *buf_cap)
+                      int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
     png_image image = {0};
     image.version = PNG_IMAGE_VERSION;
@@ -85,9 +89,9 @@ static int decode_png(const unsigned char *compressed, size_t size,
     size_t needed = PNG_IMAGE_SIZE(image);
 
     if (*buf_cap < needed) {
-        free(*out_rgba);
-        *out_rgba = malloc(needed);
-        if (!*out_rgba) {
+        free(*out_pixels);
+        *out_pixels = malloc(needed);
+        if (!*out_pixels) {
             png_image_free(&image);
             *buf_cap = 0;
             return 0;
@@ -95,26 +99,27 @@ static int decode_png(const unsigned char *compressed, size_t size,
         *buf_cap = needed;
     }
 
-    if (!png_image_finish_read(&image, NULL, *out_rgba, 0, NULL)) {
+    if (!png_image_finish_read(&image, NULL, *out_pixels, 0, NULL)) {
         png_image_free(&image);
         return 0;
     }
 
     *out_w = (int)image.width;
     *out_h = (int)image.height;
+    *out_channels = 4;
     png_image_free(&image);
     return 1;
 }
 
 static int decode_image(tjhandle tj, const unsigned char *compressed, size_t size,
-                        int *out_w, int *out_h, unsigned char **out_rgba, size_t *buf_cap)
+                        int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
     if (size >= 2 && compressed[0] == 0xff && compressed[1] == 0xd8)
-        return decode_jpeg(tj, compressed, size, out_w, out_h, out_rgba, buf_cap);
+        return decode_jpeg(tj, compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
     if (size >= 12 && memcmp(compressed, "RIFF", 4) == 0 && memcmp(compressed + 8, "WEBP", 4) == 0)
-        return decode_webp(compressed, size, out_w, out_h, out_rgba, buf_cap);
+        return decode_webp(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
     if (size >= 8 && png_sig_cmp((png_const_bytep)compressed, 0, 8) == 0)
-        return decode_png(compressed, size, out_w, out_h, out_rgba, buf_cap);
+        return decode_png(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
     return 0;
 }
 
@@ -146,6 +151,7 @@ static void *worker_thread_func(void *arg)
     WorkerContext *ctx = arg;
     PageDecoder *dec = ctx->dec;
     ctx->tj = tjInitDecompress();
+    ctx->za = archive_open_worker_handle(dec->arch);
 
     unsigned char *local_buf = NULL;
     size_t local_buf_cap = 0;
@@ -185,7 +191,6 @@ static void *worker_thread_func(void *arg)
         }
 
         if (target_page == -1) {
-            /* No work currently needed */
             dec->priority_count = 0;
             pthread_mutex_unlock(&dec->mutex);
             continue;
@@ -193,21 +198,20 @@ static void *worker_thread_func(void *arg)
 
         pthread_mutex_unlock(&dec->mutex);
 
-        /* Read and decode outside mutex */
+        /* Read completely lock-free per-thread */
         size_t compressed_size = 0;
-        unsigned char *compressed = archive_read_file(dec->arch, target_page, &compressed_size);
+        unsigned char *compressed = archive_read_file_worker(dec->arch, ctx->za, target_page, &compressed_size);
 
-        int w = 0, h = 0, success = 0;
+        int w = 0, h = 0, ch = 0, success = 0;
         if (compressed) {
             success = decode_image(ctx->tj, compressed, compressed_size,
-                                   &w, &h, &local_buf, &local_buf_cap);
+                                   &w, &h, &ch, &local_buf, &local_buf_cap);
             free(compressed);
         }
 
         pthread_mutex_lock(&dec->mutex);
         if (target_slot >= 0 && dec->slots[target_slot].page_idx == target_page) {
             if (success) {
-                /* Swap local buffer into slot to avoid copying */
                 unsigned char *tmp_ptr = dec->slots[target_slot].rgba;
                 size_t tmp_cap = dec->slots[target_slot].buffer_capacity;
 
@@ -215,6 +219,7 @@ static void *worker_thread_func(void *arg)
                 dec->slots[target_slot].buffer_capacity = local_buf_cap;
                 dec->slots[target_slot].width = w;
                 dec->slots[target_slot].height = h;
+                dec->slots[target_slot].channels = ch;
                 dec->slots[target_slot].is_ready = 1;
                 dec->slots[target_slot].in_progress = 0;
                 dec->slots[target_slot].last_access = ++dec->tick_counter;
@@ -229,10 +234,11 @@ static void *worker_thread_func(void *arg)
         }
         pthread_mutex_unlock(&dec->mutex);
 
-        /* Wake up the event loop to render immediately without polling */
         glfwPostEmptyEvent();
     }
 
+    if (ctx->za)
+        archive_close_worker_handle(ctx->za);
     if (ctx->tj)
         tjDestroy(ctx->tj);
     free(local_buf);
@@ -306,15 +312,21 @@ void decoder_request_page(PageDecoder *dec, int page_idx, int direction)
     pthread_mutex_unlock(&dec->mutex);
 }
 
-DecodedSlot *decoder_get_slot_locked(PageDecoder *dec, int page_idx)
+int decoder_get_slot_index_locked(PageDecoder *dec, int page_idx)
 {
     for (int i = 0; i < CACHE_CAPACITY; i++) {
         if (dec->slots[i].page_idx == page_idx && dec->slots[i].is_ready) {
             dec->slots[i].last_access = ++dec->tick_counter;
-            return &dec->slots[i];
+            return i;
         }
     }
-    return NULL;
+    return -1;
+}
+
+DecodedSlot *decoder_get_slot_locked(PageDecoder *dec, int page_idx)
+{
+    int idx = decoder_get_slot_index_locked(dec, page_idx);
+    return (idx >= 0) ? &dec->slots[idx] : NULL;
 }
 
 DecodedSlot *decoder_get_slot(PageDecoder *dec, int page_idx)

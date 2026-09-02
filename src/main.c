@@ -1,7 +1,5 @@
 #include <GLFW/glfw3.h>
 #include <stdio.h>
-#include <stdlib.h>
-
 #include "archive.h"
 #include "bookmark.h"
 #include "config.h"
@@ -146,15 +144,35 @@ static void scroll_callback(GLFWwindow *window, double xoffset, double yoffset)
     (void)xoffset;
     if (renderer->layout == LAYOUT_WEBTOON) {
         renderer->pan_y -= (float)(yoffset * 80.0);
-        if (renderer->pan_y < -900.0f) {
-            renderer->pan_y = 0.0f;
-            if (current_page + 1 < archive->total_pages)
+        int win_w, win_h;
+        glfwGetFramebufferSize(window, &win_w, &win_h);
+
+        decoder_lock(decoder);
+        DecodedSlot *cur = decoder_get_slot_locked(decoder, current_page);
+        float cur_h = (cur && cur->width > 0) ? (float)cur->height * ((float)win_w / (float)cur->width) : (float)win_h;
+        decoder_unlock(decoder);
+
+        float half_h = cur_h / 2.0f;
+        if (renderer->pan_y < -half_h) {
+            if (current_page + 1 < archive->total_pages) {
                 current_page++;
-        } else if (renderer->pan_y > 900.0f) {
-            renderer->pan_y = 0.0f;
-            if (current_page > 0)
+                renderer->pan_y += cur_h;
+            } else {
+                renderer->pan_y = -half_h;
+            }
+        } else if (renderer->pan_y > half_h) {
+            if (current_page > 0) {
                 current_page--;
+                decoder_lock(decoder);
+                DecodedSlot *prev = decoder_get_slot_locked(decoder, current_page);
+                float prev_h = (prev && prev->width > 0) ? (float)prev->height * ((float)win_w / (float)prev->width) : (float)win_h;
+                decoder_unlock(decoder);
+                renderer->pan_y -= prev_h;
+            } else {
+                renderer->pan_y = half_h;
+            }
         }
+
         decoder_request_page(decoder, current_page, 1);
         update_title(window);
         osd_trigger(osd);
