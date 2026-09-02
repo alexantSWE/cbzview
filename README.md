@@ -8,6 +8,7 @@ a fast, local, lightweight CBZ comic and manga viewer built for Linux.
 - **Screentone Anti-Moiré Shader**: Hardware-accelerated Catmull-Rom bicubic reconstruction eliminates(or heavily reduces) moiré artifacts on black-and-white manga scans.
 - **`ComicInfo.xml` Integration**: (if it exists) Automatic detection of reading direction (RTL/LTR), dual-page spreads, and front covers(depending on how the said xml file is structured)
 - **Event-Driven**: No CPU usage during idle reading.
+- **Remembers settings**: saves any settings that has been changed : `$XDG_CONFIG_HOME/cbzview/`(defaults to ~/.config/cbzview/)
 
 ## Controls
 | Key | Action |
