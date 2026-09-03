@@ -15,20 +15,21 @@ typedef struct {
     int thread_id;
     tjhandle tj;
     zip_t *za;
+    unsigned char *cmyk_buf;
+    size_t cmyk_buf_cap;
 } WorkerContext;
 
-static int decode_jpeg(tjhandle tj, const unsigned char *compressed, size_t size,
+static int decode_jpeg(WorkerContext *ctx, const unsigned char *compressed, size_t size,
                        int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
     int width, height, subsamp, colorspace;
-    if (tjDecompressHeader3(tj, compressed, (unsigned long)size,
+    if (tjDecompressHeader3(ctx->tj, compressed, (unsigned long)size,
         &width, &height, &subsamp, &colorspace) != 0)
         return 0;
 
     if (width <= 0 || height <= 0 || (size_t)width * (size_t)height > SIZE_MAX / 4)
         return 0;
 
-    /* 3 bytes per pixel for RGB: 25% less RAM and PCIe bandwidth */
     size_t needed = (size_t)width * (size_t)height * 3;
     if (*buf_cap < needed) {
         free(*out_pixels);
@@ -40,9 +41,42 @@ static int decode_jpeg(tjhandle tj, const unsigned char *compressed, size_t size
         *buf_cap = needed;
     }
 
-    if (tjDecompress2(tj, compressed, (unsigned long)size,
-        *out_pixels, width, 0, height, TJPF_RGB, TJFLAG_FASTDCT) != 0)
-        return 0;
+    if (colorspace == TJCS_CMYK || colorspace == TJCS_YCCK) {
+        size_t cmyk_needed = (size_t)width * (size_t)height * 4;
+        if (ctx->cmyk_buf_cap < cmyk_needed) {
+            free(ctx->cmyk_buf);
+            ctx->cmyk_buf = malloc(cmyk_needed);
+            if (!ctx->cmyk_buf) {
+                ctx->cmyk_buf_cap = 0;
+                return 0;
+            }
+            ctx->cmyk_buf_cap = cmyk_needed;
+        }
+
+        if (tjDecompress2(ctx->tj, compressed, (unsigned long)size,
+            ctx->cmyk_buf, width, 0, height, TJPF_CMYK, TJFLAG_FASTDCT) != 0)
+            return 0;
+
+        /* Convert CMYK to RGB directly into destination buffer */
+        const unsigned char *src = ctx->cmyk_buf;
+        unsigned char *dst = *out_pixels;
+        size_t total_pixels = (size_t)width * (size_t)height;
+
+        for (size_t i = 0; i < total_pixels; i++) {
+            unsigned int c = src[i * 4 + 0];
+            unsigned int m = src[i * 4 + 1];
+            unsigned int y = src[i * 4 + 2];
+            unsigned int k = src[i * 4 + 3];
+
+            dst[i * 3 + 0] = (unsigned char)((c * k) / 255);
+            dst[i * 3 + 1] = (unsigned char)((m * k) / 255);
+            dst[i * 3 + 2] = (unsigned char)((y * k) / 255);
+        }
+    } else {
+        if (tjDecompress2(ctx->tj, compressed, (unsigned long)size,
+            *out_pixels, width, 0, height, TJPF_RGB, TJFLAG_FASTDCT) != 0)
+            return 0;
+    }
 
     *out_w = width;
     *out_h = height;
@@ -111,11 +145,11 @@ static int decode_png(const unsigned char *compressed, size_t size,
     return 1;
 }
 
-static int decode_image(tjhandle tj, const unsigned char *compressed, size_t size,
+static int decode_image(WorkerContext *ctx, const unsigned char *compressed, size_t size,
                         int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
     if (size >= 2 && compressed[0] == 0xff && compressed[1] == 0xd8)
-        return decode_jpeg(tj, compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
+        return decode_jpeg(ctx, compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
     if (size >= 12 && memcmp(compressed, "RIFF", 4) == 0 && memcmp(compressed + 8, "WEBP", 4) == 0)
         return decode_webp(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
     if (size >= 8 && png_sig_cmp((png_const_bytep)compressed, 0, 8) == 0)
@@ -131,9 +165,8 @@ static int select_eviction_slot(PageDecoder *dec, int target_page)
 
     for (int i = 0; i < CACHE_CAPACITY; i++) {
         if (!dec->slots[i].in_progress) {
-            if (dec->slots[i].page_idx == -1) {
-                return i; /* Found completely empty slot */
-            }
+            if (dec->slots[i].page_idx == -1)
+                return i;
 
             int dist = abs(dec->slots[i].page_idx - target_page);
             if (dist > max_dist || (dist == max_dist && dec->slots[i].last_access < oldest_access)) {
@@ -173,10 +206,11 @@ static void *worker_thread_func(void *arg)
             int p = dec->priority_queue[i];
             int already = 0;
             for (int s = 0; s < CACHE_CAPACITY; s++) {
-                if (dec->slots[s].page_idx == p && (dec->slots[s].is_ready || dec->slots[s].in_progress)) {
+                if (dec->slots[s].page_idx == p &&
+                    (dec->slots[s].is_ready || dec->slots[s].in_progress || dec->slots[s].is_failed)) {
                     already = 1;
-                    break;
-                }
+                break;
+                    }
             }
             if (!already) {
                 target_slot = select_eviction_slot(dec, dec->current_requested_page);
@@ -185,6 +219,7 @@ static void *worker_thread_func(void *arg)
                     dec->slots[target_slot].page_idx = p;
                     dec->slots[target_slot].in_progress = 1;
                     dec->slots[target_slot].is_ready = 0;
+                    dec->slots[target_slot].is_failed = 0;
                     break;
                 }
             }
@@ -198,13 +233,12 @@ static void *worker_thread_func(void *arg)
 
         pthread_mutex_unlock(&dec->mutex);
 
-        /* Read completely lock-free per-thread */
         size_t compressed_size = 0;
         unsigned char *compressed = archive_read_file_worker(dec->arch, ctx->za, target_page, &compressed_size);
 
         int w = 0, h = 0, ch = 0, success = 0;
         if (compressed) {
-            success = decode_image(ctx->tj, compressed, compressed_size,
+            success = decode_image(ctx, compressed, compressed_size,
                                    &w, &h, &ch, &local_buf, &local_buf_cap);
             free(compressed);
         }
@@ -221,15 +255,16 @@ static void *worker_thread_func(void *arg)
                 dec->slots[target_slot].height = h;
                 dec->slots[target_slot].channels = ch;
                 dec->slots[target_slot].is_ready = 1;
+                dec->slots[target_slot].is_failed = 0;
                 dec->slots[target_slot].in_progress = 0;
                 dec->slots[target_slot].last_access = ++dec->tick_counter;
 
                 local_buf = tmp_ptr;
                 local_buf_cap = tmp_cap;
             } else {
-                dec->slots[target_slot].page_idx = -1;
-                dec->slots[target_slot].in_progress = 0;
                 dec->slots[target_slot].is_ready = 0;
+                dec->slots[target_slot].is_failed = 1;
+                dec->slots[target_slot].in_progress = 0;
             }
         }
         pthread_mutex_unlock(&dec->mutex);
@@ -241,6 +276,7 @@ static void *worker_thread_func(void *arg)
         archive_close_worker_handle(ctx->za);
     if (ctx->tj)
         tjDestroy(ctx->tj);
+    free(ctx->cmyk_buf);
     free(local_buf);
     free(ctx);
     return NULL;

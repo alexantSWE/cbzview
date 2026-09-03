@@ -51,6 +51,7 @@ CBZArchive *archive_open(const char *filepath)
         return NULL;
     }
 
+    /* MADV_RANDOM prevents kernel thrashing on multi-gigabyte files */
     madvise(mmap_base, file_size, MADV_RANDOM);
 
     zip_error_t zerr;
@@ -76,7 +77,7 @@ CBZArchive *archive_open(const char *filepath)
     zip_error_fini(&zerr);
 
     zip_int64_t num_entries = zip_get_num_entries(za, 0);
-    if (num_entries < 0) {
+    if (num_entries <= 0) {
         zip_close(za);
         munmap(mmap_base, file_size);
         close(fd);
@@ -98,7 +99,7 @@ CBZArchive *archive_open(const char *filepath)
     pthread_mutex_init(&arch->lock, NULL);
 
     arch->pages = calloc((size_t)num_entries, sizeof(*arch->pages));
-    if (num_entries > 0 && !arch->pages) {
+    if (!arch->pages) {
         archive_close(arch);
         return NULL;
     }
@@ -119,7 +120,9 @@ CBZArchive *archive_open(const char *filepath)
             continue;
 
         struct zip_stat entry_st;
-        if (zip_stat_index(za, i, 0, &entry_st) != 0 || entry_st.size > SIZE_MAX)
+        zip_stat_init(&entry_st);
+        if (zip_stat_index(za, i, 0, &entry_st) != 0 ||
+            !(entry_st.valid & ZIP_STAT_SIZE) || entry_st.size == 0 || entry_st.size > SIZE_MAX)
             continue;
 
         PageMeta *page = &arch->pages[arch->total_pages];
@@ -134,27 +137,38 @@ CBZArchive *archive_open(const char *filepath)
         arch->total_pages++;
     }
 
+    if (arch->total_pages == 0) {
+        archive_close(arch);
+        return NULL;
+    }
+
     qsort(arch->pages, (size_t)arch->total_pages, sizeof(*arch->pages), compare_natural);
 
     /* Parse ComicInfo.xml metadata if present */
     arch->info = comicinfo_create();
     if (arch->info && comic_info_idx >= 0) {
         struct zip_stat xml_st;
-        if (zip_stat_index(za, (zip_uint64_t)comic_info_idx, 0, &xml_st) == 0 && xml_st.size > 0 && xml_st.size < 50000000) {
+        zip_stat_init(&xml_st);
+        if (zip_stat_index(za, (zip_uint64_t)comic_info_idx, 0, &xml_st) == 0 &&
+            (xml_st.valid & ZIP_STAT_SIZE) && xml_st.size > 0 && xml_st.size < 50000000) {
             zip_file_t *zf = zip_fopen_index(za, (zip_uint64_t)comic_info_idx, 0);
-            if (zf) {
-                char *xml_buf = malloc(xml_st.size + 1);
-                if (xml_buf) {
-                    zip_int64_t r = zip_fread(zf, xml_buf, xml_st.size);
-                    if (r > 0) {
-                        xml_buf[r] = '\0';
-                        comicinfo_parse_xml(arch->info, xml_buf, (size_t)r, arch->total_pages);
-                    }
-                    free(xml_buf);
+        if (zf) {
+            char *xml_buf = malloc(xml_st.size + 1);
+            if (xml_buf) {
+                size_t xread = 0;
+                while (xread < xml_st.size) {
+                    zip_int64_t r = zip_fread(zf, xml_buf + xread, xml_st.size - xread);
+                    if (r <= 0)
+                        break;
+                    xread += (size_t)r;
                 }
-                zip_fclose(zf);
+                xml_buf[xread] = '\0';
+                comicinfo_parse_xml(arch->info, xml_buf, xread, arch->total_pages);
+                free(xml_buf);
             }
+            zip_fclose(zf);
         }
+            }
     }
 
     return arch;
@@ -193,7 +207,10 @@ unsigned char *archive_read_file_worker(CBZArchive *arch, zip_t *za, int page_id
         return NULL;
 
     size_t size = (size_t)arch->pages[page_idx].uncomp_size;
-    unsigned char *buffer = malloc(size ? size : 1);
+    if (size == 0 || size > (size_t)256 * 1024 * 1024)
+        return NULL;
+
+    unsigned char *buffer = malloc(size);
     if (!buffer)
         return NULL;
 
@@ -203,15 +220,27 @@ unsigned char *archive_read_file_worker(CBZArchive *arch, zip_t *za, int page_id
         return NULL;
     }
 
-    zip_int64_t bytes_read = zip_fread(zf, buffer, size);
+    /* Loop until the complete entry stream has been read */
+    size_t total_read = 0;
+    while (total_read < size) {
+        zip_int64_t r = zip_fread(zf, buffer + total_read, size - total_read);
+        if (r < 0) {
+            free(buffer);
+            zip_fclose(zf);
+            return NULL;
+        }
+        if (r == 0)
+            break;
+        total_read += (size_t)r;
+    }
     zip_fclose(zf);
 
-    if (bytes_read < 0 || (size_t)bytes_read != size) {
+    if (total_read != size) {
         free(buffer);
         return NULL;
     }
 
-    *out_size = (size_t)bytes_read;
+    *out_size = total_read;
     return buffer;
 }
 

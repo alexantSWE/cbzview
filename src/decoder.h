@@ -16,6 +16,7 @@ typedef struct {
     size_t buffer_capacity;
     int is_ready;
     int in_progress;
+    int is_failed;
     uint64_t last_access;
 } DecodedSlot;
 
