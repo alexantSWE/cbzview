@@ -25,13 +25,14 @@ static void update_title(GLFWwindow *window)
     const char *fit = (renderer->fit == FIT_HEIGHT) ? "Fit-Height" : "Fit-Width";
 
     char title[256];
+    const char *shifted = renderer->spread_offset ? ", Shift" : "";
     if (archive->info && archive->info->has_metadata && *archive->info->series) {
-        snprintf(title, sizeof(title), "cbzview - %s %s [%d / %d] (%s, %s, %s)",
+        snprintf(title, sizeof(title), "cbzview - %s %s [%d / %d] (%s, %s, %s%s)",
                  archive->info->series, archive->info->number,
-                 current_page + 1, archive->total_pages, layout, direction, fit);
+                 current_page + 1, archive->total_pages, layout, direction, fit, shifted);
     } else {
-        snprintf(title, sizeof(title), "cbzview - [%d / %d] (%s, %s, %s)",
-                 current_page + 1, archive->total_pages, layout, direction, fit);
+        snprintf(title, sizeof(title), "cbzview - [%d / %d] (%s, %s, %s%s)",
+                 current_page + 1, archive->total_pages, layout, direction, fit, shifted);
     }
     glfwSetWindowTitle(window, title);
 }
@@ -50,8 +51,9 @@ static void key_callback(GLFWwindow *window, int key, int scancode, int action, 
     if (action != GLFW_PRESS && action != GLFW_REPEAT)
         return;
 
-    int step = (renderer->layout == LAYOUT_SINGLE || renderer->layout == LAYOUT_WEBTOON ||
-    current_page == 0) ? 1 : 2;
+    int is_single_step = (renderer->layout == LAYOUT_SINGLE || renderer->layout == LAYOUT_WEBTOON ||
+                         (current_page == 0 && !renderer->spread_offset));
+    int step = is_single_step ? 1 : 2;
 
     decoder_lock(decoder);
     DecodedSlot *slot = decoder_get_slot_locked(decoder, current_page);
@@ -108,6 +110,11 @@ static void key_callback(GLFWwindow *window, int key, int scancode, int action, 
 
         case GLFW_KEY_C:
             renderer->contrast_boost = !renderer->contrast_boost;
+            osd_trigger(osd);
+            break;
+
+        case GLFW_KEY_S:
+            renderer->spread_offset = !renderer->spread_offset;
             osd_trigger(osd);
             break;
 
@@ -179,12 +186,29 @@ static void scroll_callback(GLFWwindow *window, double xoffset, double yoffset)
         return;
     }
 
-    if (yoffset > 0)
-        renderer->zoom *= 1.12f;
-    else if (yoffset < 0) {
-        renderer->zoom /= 1.12f;
-        if (renderer->zoom < 0.15f)
-            renderer->zoom = 0.15f;
+    double mx, my;
+    glfwGetCursorPos(window, &mx, &my);
+    int ww, wh;
+    glfwGetWindowSize(window, &ww, &wh);
+
+    float mouse_x = (float)mx - ((float)ww / 2.0f);
+    float mouse_y = (float)my - ((float)wh / 2.0f);
+    float old_zoom = renderer->zoom;
+    float new_zoom = old_zoom;
+
+    if (yoffset > 0) {
+        new_zoom *= 1.12f;
+    } else if (yoffset < 0) {
+        new_zoom /= 1.12f;
+        if (new_zoom < 0.15f)
+            new_zoom = 0.15f;
+    }
+
+    if (new_zoom != old_zoom) {
+        float ratio = new_zoom / old_zoom;
+        renderer->pan_x = mouse_x - (mouse_x - renderer->pan_x) * ratio;
+        renderer->pan_y = mouse_y - (mouse_y - renderer->pan_y) * ratio;
+        renderer->zoom = new_zoom;
     }
     osd_trigger(osd);
 }
@@ -244,6 +268,11 @@ int main(int argc, char **argv)
     #if defined(GLFW_X11_CLASS_NAME)
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "cbzview");
     #endif
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
     GLFWwindow *window = glfwCreateWindow(1280, 800, "cbzview", NULL, NULL);
     if (!window) {

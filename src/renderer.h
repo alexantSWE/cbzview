@@ -40,14 +40,23 @@ typedef struct {
     ReadDirection direction;
     FitMode fit;
     int contrast_boost;
+    int spread_offset;
     float zoom;
     float pan_x;
     float pan_y;
+
+    GLuint vao;
+    GLuint vbo;
 
     GLuint shader_prog;
     GLint u_tex;
     GLint u_tex_size;
     GLint u_contrast;
+    GLint u_viewport;
+    GLint u_pan;
+    GLint u_zoom;
+    GLint u_rect;
+    GLint u_is_placeholder;
 
     GPUTextureSlot textures[CACHE_CAPACITY];
 } ComicRenderer;
