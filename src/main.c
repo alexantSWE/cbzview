@@ -1,4 +1,5 @@
 #include <GLFW/glfw3.h>
+#include <limits.h>
 #include <stdio.h>
 #include "archive.h"
 #include "bookmark.h"
@@ -14,8 +15,77 @@ static OSD *osd;
 static CBZArchive *archive;
 static int dragging;
 static double last_x, last_y;
-static const char *comic_file_path;
+static char comic_file_path[PATH_MAX];
 static AppConfig config;
+
+static void clamp_page(void);
+static void update_title(GLFWwindow *window);
+
+static void open_comic(GLFWwindow *window, const char *path)
+{
+    if (archive && config.auto_resume && comic_file_path[0]) {
+        bookmark_save(comic_file_path, current_page, renderer->layout,
+                      renderer->direction, renderer->fit);
+    }
+
+    if (decoder) {
+        decoder_cleanup(decoder);
+        decoder = NULL;
+    }
+    if (archive) {
+        archive_close(archive);
+        archive = NULL;
+    }
+
+    archive = archive_open(path);
+    if (!archive || archive->total_pages == 0) {
+        fprintf(stderr, "Failed to load archive or no supported images found: %s\n", path);
+        if (archive) {
+            archive_close(archive);
+            archive = NULL;
+        }
+        return;
+    }
+
+    snprintf(comic_file_path, sizeof(comic_file_path), "%s", path);
+
+    decoder = decoder_init(archive);
+    if (!decoder) {
+        archive_close(archive);
+        archive = NULL;
+        return;
+    }
+
+    if (renderer) {
+        for (int i = 0; i < CACHE_CAPACITY; i++)
+            renderer->textures[i].page_idx = -1;
+    }
+
+    renderer->pan_x = renderer->pan_y = 0.0f;
+    renderer->zoom = 1.0f;
+    current_page = 0;
+
+    if (archive->info && archive->info->has_metadata) {
+        if (archive->info->is_manga)
+            renderer->direction = DIR_RTL;
+    }
+
+    if (config.auto_resume) {
+        bookmark_load(comic_file_path, &current_page, &renderer->layout,
+                      &renderer->direction, &renderer->fit);
+    }
+    clamp_page();
+
+    decoder_request_page(decoder, current_page, (renderer->direction == DIR_RTL) ? -1 : 1);
+    osd_trigger(osd);
+    update_title(window);
+}
+
+static void drop_callback(GLFWwindow *window, int count, const char **paths)
+{
+    if (count > 0 && paths && paths[0])
+        open_comic(window, paths[0]);
+}
 
 static void update_title(GLFWwindow *window)
 {
@@ -192,7 +262,7 @@ static void scroll_callback(GLFWwindow *window, double xoffset, double yoffset)
     glfwGetWindowSize(window, &ww, &wh);
 
     float mouse_x = (float)mx - ((float)ww / 2.0f);
-    float mouse_y = (float)my - ((float)wh / 2.0f);
+    float mouse_y = ((float)wh / 2.0f) - (float)my;
     float old_zoom = renderer->zoom;
     float new_zoom = old_zoom;
 
@@ -245,19 +315,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "Usage: %s <comic.cbz>\n", argv[0]);
         return 1;
     }
-    comic_file_path = argv[1];
+    snprintf(comic_file_path, sizeof(comic_file_path), "%s", argv[1]);
 
     config_load(&config);
 
-    archive = archive_open(comic_file_path);
-    if (!archive || archive->total_pages == 0) {
-        fprintf(stderr, "Failed to load archive or no supported images found.\n");
-        archive_close(archive);
-        return 1;
-    }
-
     if (!glfwInit()) {
-        archive_close(archive);
         fprintf(stderr, "Failed to initialize GLFW.\n");
         return 1;
     }
@@ -288,18 +350,15 @@ int main(int argc, char **argv)
     glfwSetScrollCallback(window, scroll_callback);
     glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetCursorPosCallback(window, cursor_position_callback);
+    glfwSetDropCallback(window, drop_callback);
 
-    decoder = decoder_init(archive);
     renderer = renderer_init();
     osd = osd_init();
-
-    if (!decoder || !renderer || !osd) {
-        decoder_cleanup(decoder);
+    if (!renderer || !osd) {
         renderer_cleanup(renderer);
         osd_cleanup(osd);
         glfwDestroyWindow(window);
         glfwTerminate();
-        archive_close(archive);
         return 1;
     }
 
@@ -308,24 +367,14 @@ int main(int argc, char **argv)
     renderer->fit = config.default_fit;
     renderer->contrast_boost = config.contrast_boost;
 
-    /* Auto-configure from ComicInfo.xml metadata if present */
-    if (archive->info && archive->info->has_metadata) {
-        if (archive->info->is_manga)
-            renderer->direction = DIR_RTL;
-        printf("[cbzview] Metadata Loaded: %s %s - %s (Manga: %s)\n",
-               archive->info->series, archive->info->number, archive->info->title,
-               archive->info->is_manga ? "Yes (RTL)" : "No (LTR)");
+    open_comic(window, argv[1]);
+    if (!archive) {
+        renderer_cleanup(renderer);
+        osd_cleanup(osd);
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
     }
-
-    if (config.auto_resume) {
-        bookmark_load(comic_file_path, &current_page, &renderer->layout,
-                      &renderer->direction, &renderer->fit);
-    }
-    clamp_page();
-
-    decoder_request_page(decoder, current_page, (renderer->direction == DIR_RTL) ? -1 : 1);
-    osd_trigger(osd);
-    update_title(window);
 
     /* Event-Driven Render Loop */
     while (!glfwWindowShouldClose(window)) {

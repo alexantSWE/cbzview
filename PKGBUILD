@@ -13,6 +13,8 @@ depends=(
     'libjpeg-turbo'
     'libwebp'
     'libpng'
+    'libavif'
+    'libjxl'
     'libglvnd'
     'hicolor-icon-theme'
 )

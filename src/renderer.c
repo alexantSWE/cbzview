@@ -335,11 +335,16 @@ void renderer_render_frame(ComicRenderer *rend, PageDecoder *dec, int cur_page, 
             goto finish_render;
         }
     } else {
-        int left_idx = (rend->direction == DIR_LTR) ? cur_page : cur_page + 1;
-        int right_idx = (rend->direction == DIR_LTR) ? cur_page + 1 : cur_page;
+        int p0 = cur_page;
+        int p1 = cur_page + 1;
+        if (p1 >= dec->arch->total_pages)
+            p1 = -1;
 
-        int left_sidx = decoder_get_slot_index_locked(dec, left_idx);
-        int right_sidx = decoder_get_slot_index_locked(dec, right_idx);
+        int left_idx = (rend->direction == DIR_LTR) ? p0 : p1;
+        int right_idx = (rend->direction == DIR_LTR) ? p1 : p0;
+
+        int left_sidx = (left_idx >= 0) ? decoder_get_slot_index_locked(dec, left_idx) : -1;
+        int right_sidx = (right_idx >= 0) ? decoder_get_slot_index_locked(dec, right_idx) : -1;
 
         DecodedSlot *left_slot = (left_sidx >= 0) ? &dec->slots[left_sidx] : NULL;
         DecodedSlot *right_slot = (right_sidx >= 0) ? &dec->slots[right_sidx] : NULL;

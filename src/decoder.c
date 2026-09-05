@@ -1,6 +1,8 @@
 #include "decoder.h"
 
 #include <GLFW/glfw3.h>
+#include <avif/avif.h>
+#include <jxl/decode.h>
 #include <png.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,9 +70,9 @@ static int decode_jpeg(WorkerContext *ctx, const unsigned char *compressed, size
             unsigned int y = src[i * 4 + 2];
             unsigned int k = src[i * 4 + 3];
 
-            dst[i * 3 + 0] = (unsigned char)((c * k) / 255);
-            dst[i * 3 + 1] = (unsigned char)((m * k) / 255);
-            dst[i * 3 + 2] = (unsigned char)((y * k) / 255);
+            dst[i * 3 + 0] = (unsigned char)(((255 - c) * (255 - k)) / 255);
+            dst[i * 3 + 1] = (unsigned char)(((255 - m) * (255 - k)) / 255);
+            dst[i * 3 + 2] = (unsigned char)(((255 - y) * (255 - k)) / 255);
         }
     } else {
         if (tjDecompress2(ctx->tj, compressed, (unsigned long)size,
@@ -145,6 +147,114 @@ static int decode_png(const unsigned char *compressed, size_t size,
     return 1;
 }
 
+static int decode_avif(const unsigned char *compressed, size_t size,
+                       int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
+{
+    avifDecoder *decoder = avifDecoderCreate();
+    if (!decoder)
+        return 0;
+
+    if (avifDecoderSetIOMemory(decoder, compressed, size) != AVIF_RESULT_OK ||
+        avifDecoderParse(decoder) != AVIF_RESULT_OK ||
+        avifDecoderNextImage(decoder) != AVIF_RESULT_OK) {
+        avifDecoderDestroy(decoder);
+        return 0;
+    }
+
+    int w = (int)decoder->image->width;
+    int h = (int)decoder->image->height;
+    size_t needed = (size_t)w * (size_t)h * 4;
+
+    if (*buf_cap < needed) {
+        free(*out_pixels);
+        *out_pixels = malloc(needed);
+        if (!*out_pixels) {
+            *buf_cap = 0;
+            avifDecoderDestroy(decoder);
+            return 0;
+        }
+        *buf_cap = needed;
+    }
+
+    avifRGBImage rgb;
+    avifRGBImageSetDefaults(&rgb, decoder->image);
+    rgb.format = AVIF_RGB_FORMAT_RGBA;
+    rgb.depth = 8;
+    rgb.pixels = *out_pixels;
+    rgb.rowBytes = (uint32_t)(w * 4);
+
+    avifResult res = avifImageYUVToRGB(decoder->image, &rgb);
+    avifDecoderDestroy(decoder);
+    if (res != AVIF_RESULT_OK)
+        return 0;
+
+    *out_w = w;
+    *out_h = h;
+    *out_channels = 4;
+    return 1;
+}
+
+static int decode_jxl(const unsigned char *compressed, size_t size,
+                      int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
+{
+    JxlDecoder *dec = JxlDecoderCreate(NULL);
+    if (!dec)
+        return 0;
+
+    if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS) {
+        JxlDecoderDestroy(dec);
+        return 0;
+    }
+
+    JxlDecoderSetInput(dec, compressed, size);
+    JxlDecoderCloseInput(dec);
+
+    JxlBasicInfo info;
+    JxlPixelFormat format = {4, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+    int w = 0, h = 0;
+
+    for (;;) {
+        JxlDecoderStatus status = JxlDecoderProcessInput(dec);
+        if (status == JXL_DEC_ERROR || status == JXL_DEC_NEED_MORE_INPUT) {
+            JxlDecoderDestroy(dec);
+            return 0;
+        }
+        if (status == JXL_DEC_BASIC_INFO) {
+            if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS) {
+                JxlDecoderDestroy(dec);
+                return 0;
+            }
+            w = (int)info.xsize;
+            h = (int)info.ysize;
+            size_t needed = (size_t)w * (size_t)h * 4;
+            if (*buf_cap < needed) {
+                free(*out_pixels);
+                *out_pixels = malloc(needed);
+                if (!*out_pixels) {
+                    *buf_cap = 0;
+                    JxlDecoderDestroy(dec);
+                    return 0;
+                }
+                *buf_cap = needed;
+            }
+        } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+            size_t buffer_size = (size_t)w * (size_t)h * 4;
+            if (JxlDecoderSetImageOutBuffer(dec, &format, *out_pixels, buffer_size) != JXL_DEC_SUCCESS) {
+                JxlDecoderDestroy(dec);
+                return 0;
+            }
+        } else if (status == JXL_DEC_FULL_IMAGE || status == JXL_DEC_SUCCESS) {
+            break;
+        }
+    }
+
+    JxlDecoderDestroy(dec);
+    *out_w = w;
+    *out_h = h;
+    *out_channels = 4;
+    return 1;
+}
+
 static int decode_image(WorkerContext *ctx, const unsigned char *compressed, size_t size,
                         int *out_w, int *out_h, int *out_channels, unsigned char **out_pixels, size_t *buf_cap)
 {
@@ -154,6 +264,14 @@ static int decode_image(WorkerContext *ctx, const unsigned char *compressed, siz
         return decode_webp(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
     if (size >= 8 && png_sig_cmp((png_const_bytep)compressed, 0, 8) == 0)
         return decode_png(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
+
+    avifROData raw = {(const uint8_t *)compressed, size};
+    if (avifPeekCompatibleFileType(&raw))
+        return decode_avif(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
+
+    if (JxlSignatureCheck(compressed, size) >= JXL_SIG_CODESTREAM)
+        return decode_jxl(compressed, size, out_w, out_h, out_channels, out_pixels, buf_cap);
+
     return 0;
 }
 

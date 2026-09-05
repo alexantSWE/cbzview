@@ -1,8 +1,8 @@
 CC ?= gcc
 CFLAGS ?= -O3 -Wall -Wextra
 override CPPFLAGS += -D_GNU_SOURCE -DGL_GLEXT_PROTOTYPES \
-                     $(shell pkg-config --cflags glfw3 libzip libturbojpeg libwebp libpng gl)
-LIBS := $(shell pkg-config --libs glfw3 libzip libturbojpeg libwebp libpng gl) -lm -pthread
+                     $(shell pkg-config --cflags glfw3 libzip libturbojpeg libwebp libpng gl libavif libjxl)
+LIBS := $(shell pkg-config --libs glfw3 libzip libturbojpeg libwebp libpng gl libavif libjxl) -lm -pthread
 
 PREFIX ?= /usr
 BINDIR = $(PREFIX)/bin

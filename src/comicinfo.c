@@ -11,6 +11,61 @@ ComicInfo *comicinfo_create(void)
   return info;
 }
 
+static void decode_xml_entities(char *s)
+{
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '&') {
+            if (strncmp(r, "&amp;", 5) == 0) {
+                *w++ = '&';
+                r += 5;
+            } else if (strncmp(r, "&lt;", 4) == 0) {
+                *w++ = '<';
+                r += 4;
+            } else if (strncmp(r, "&gt;", 4) == 0) {
+                *w++ = '>';
+                r += 4;
+            } else if (strncmp(r, "&quot;", 6) == 0) {
+                *w++ = '"';
+                r += 6;
+            } else if (strncmp(r, "&apos;", 6) == 0) {
+                *w++ = '\'';
+                r += 6;
+            } else if (strncmp(r, "&#x", 3) == 0 || strncmp(r, "&#", 2) == 0) {
+                char *end = NULL;
+                long value = strtol(r + 2 + (r[2] == 'x' || r[2] == 'X' ? 1 : 0), &end, r[2] == 'x' || r[2] == 'X' ? 16 : 10);
+                if (end && (*end == ';')) {
+                    if (value >= 0 && value <= 0x10FFFF) {
+                        if (value <= 0x7F) {
+                            *w++ = (char)value;
+                        } else if (value <= 0x7FF) {
+                            *w++ = (char)(0xC0 | ((value >> 6) & 0x1F));
+                            *w++ = (char)(0x80 | (value & 0x3F));
+                        } else if (value <= 0xFFFF) {
+                            *w++ = (char)(0xE0 | ((value >> 12) & 0x0F));
+                            *w++ = (char)(0x80 | ((value >> 6) & 0x3F));
+                            *w++ = (char)(0x80 | (value & 0x3F));
+                        } else {
+                            *w++ = (char)(0xF0 | ((value >> 18) & 0x07));
+                            *w++ = (char)(0x80 | ((value >> 12) & 0x3F));
+                            *w++ = (char)(0x80 | ((value >> 6) & 0x3F));
+                            *w++ = (char)(0x80 | (value & 0x3F));
+                        }
+                        r = end + 1;
+                        continue;
+                    }
+                }
+                *w++ = *r++;
+            } else {
+                *w++ = *r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
 static void extract_tag_content(const char *xml, const char *tag, char *out, size_t out_sz)
 {
   char open_tag[64], close_tag[64];
@@ -32,6 +87,7 @@ static void extract_tag_content(const char *xml, const char *tag, char *out, siz
 
   memcpy(out, start, len);
   out[len] = '\0';
+  decode_xml_entities(out);
 }
 
 void comicinfo_parse_xml(ComicInfo *info, const char *xml_data, size_t len, int total_pages)
